@@ -1,0 +1,27 @@
+{
+  "cfg_version": 2,
+  "name": "MagTag (Office)",
+  "display": {
+    "driver": "SSD1680",
+    "panel": "adafruit-magtag",
+    "width": 128,
+    "height": 296,
+    "rotation": 3,
+    "mode": "mono"
+  },
+  "interface": {
+    "kind": "spi_epd",
+    "spi": {
+      "bus": 0,
+      "mosi": "D35",
+      "sck": "D36"
+    },
+    "pins": {
+      "cs": "D8",
+      "dc": "D7",
+      "reset": "D6",
+      "busy": "D5",
+      "sram_cs": null
+    }
+  }
+}
