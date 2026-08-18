@@ -190,7 +190,8 @@ class Marquee:
         if self._needs_reconnect:
             self._log("Reconnecting to Adafruit IO...")
             try:
-              self._client.reconnect(resub_topics=False)
+              # Reconnect and re-subscribe to the feeds
+              self._client.reconnect()
               self._needs_reconnect = False
             except (MQTT.MMQTTException, OSError, AssertionError) as err:
               # Back off and try again next loop() to avoid dropping into the REPL
@@ -217,11 +218,12 @@ class Marquee:
         """Called by MiniMQTT once the broker accepts the connection."""
         self._log("Connected to Adafruit IO!")
 
+        wake_reason = alarm.wake_alarm
         # Publish status
         try:
             client.publish(
                 self._feed_status,
-                json.dumps({"state": "awake", "wake_reason": "timer"}),
+                json.dumps({"state": "awake", "wake_reason": wake_reason}),
             )
         except (MQTT.MMQTTException, OSError) as err:
             self._log(f"Could not publish awake status ({err}), continuing anyway")
@@ -235,7 +237,7 @@ class Marquee:
         client.publish(f"{self._feed}/get", "get")
         # If we were previously sleeping, we need to fetch the sleep feed to see if we
         # should sleep again
-        if alarm.wake_alarm is not None:
+        if wake_reason is not None:
             self._log("Woke from sleep, fetching sleep feed to see if we should sleep again")
             client.publish(f"{self._feed_sleep}/get", "get")
 
@@ -336,6 +338,7 @@ class Marquee:
                         "alarm_type": alarm_type,
                     }
                 ),
+                qos=1
             )
         except (MQTT.MMQTTException, OSError) as err:
             self._log(f"Could not publish sleep status ({err}), continuing to sleep anyway")
@@ -361,6 +364,8 @@ class Marquee:
             alarm.light_sleep_until_alarms(*alarms)
             # Resume execution after light sleep
             self._log(f"Woke from light sleep on {alarm.wake_alarm}")
+            # Force a reconnection in case the broker closed the port
+            self._needs_reconnect = True
 
     def _parse_sleep(self, message):
         """Validate a sleep payload and prepare the alarms it describes.
