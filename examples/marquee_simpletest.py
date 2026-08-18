@@ -1,12 +1,18 @@
-# SPDX-FileCopyrightText: 2021 ladyada for Adafruit Industries
-# SPDX-License-Identifier: MIT
+# SPDX-FileCopyrightText: Copyright (c) 2026 brentru for Adafruit Industries
+#
+# SPDX-License-Identifier: Unlicense
+"""Adafruit IO Marquee simple test.
+"""
+
 from os import getenv
+
 import adafruit_connection_manager
 import wifi
+
 from adafruit_marquee import Marquee
 
-# Configure WiFi
 ssid = getenv("CIRCUITPY_WIFI_SSID")
+
 print(f"Connecting to {ssid}")
 wifi.radio.connect(ssid, getenv("CIRCUITPY_WIFI_PASSWORD"))
 print(f"Connected to {ssid}")
@@ -15,7 +21,6 @@ print(f"Connected to {ssid}")
 pool = adafruit_connection_manager.get_radio_socketpool(wifi.radio)
 ssl_context = adafruit_connection_manager.get_radio_ssl_context(wifi.radio)
 
-# Configure EPD Marquee API
 marquee = Marquee(
     socket_pool=pool,
     ssl_context=ssl_context,
