@@ -33,7 +33,9 @@ import adafruit_imageload
 import adafruit_minimqtt.adafruit_minimqtt as MQTT
 import alarm
 import board
+import busio
 import displayio
+from fourwire import FourWire
 
 __version__ = "0.0.0+auto.0"
 __repo__ = "https://github.com/adafruit/Adafruit_CircuitPython_Marquee.git"
@@ -49,6 +51,12 @@ _DEFAULT_CONFIG_FILE = "cfg-marquee.json"
 
 _ALARM_TYPES = ("timer", "pin", "timer+pin")
 _SLEEP_MODES = ("light", "deep")
+
+
+def get_pin_from_cfg(pin_cfg, name):
+    """Resolve a board.* pin name from a config section."""
+    pin_name = pin_cfg.get(name)
+    return getattr(board, pin_name.replace("board.", "")) if pin_name else None
 
 
 class Marquee:
@@ -78,6 +86,7 @@ class Marquee:
         debug=False,
     ):
         self._debug = debug
+        self._wake_reason = self.get_wake_reason()
 
         for name, value in (
             ("socket_pool", socket_pool),
@@ -150,12 +159,52 @@ class Marquee:
 
     def _init_display(self):
         """Attach to the display described by the configuration file."""
-        # TODO: Build the panel from self._iface (spi bus + cs/dc/reset/busy pins) via
-        # adafruit_epd so boards without a built-in display are supported.
+        if self._panel.get("driver") == "SSD1680":
+            # Initialize SSD1680 display driver
+            import adafruit_ssd1680
+
+            displayio.release_displays()
+            # Create the display bus
+            spi_config = self._iface.get("spi", {})
+            if "sck" in spi_config or "mosi" in spi_config:
+                spi = busio.SPI(
+                    clock=get_pin_from_cfg(spi_config, "sck"),
+                    MOSI=get_pin_from_cfg(spi_config, "mosi"),
+                )
+            else:
+                spi = board.SPI()
+            pin_config = self._iface.get("pins", {})
+            epd_cs = get_pin_from_cfg(pin_config, "cs")
+            epd_dc = get_pin_from_cfg(pin_config, "dc")
+            epd_reset = get_pin_from_cfg(pin_config, "reset")
+            self._epd_busy_pin = get_pin_from_cfg(pin_config, "busy")
+            display_bus = FourWire(
+                spi,
+                command=epd_dc,
+                chip_select=epd_cs,
+                reset=epd_reset,
+                baudrate=spi_config.get("baudrate", 1_000_000),
+            )
+            time.sleep(1)
+            # Create the SSD1680 display driver
+            self._display = adafruit_ssd1680.SSD1680(
+                display_bus,
+                width=250,
+                height=122,
+                busy_pin=self._epd_busy_pin,
+                highlight_color=0xFF0000,
+                rotation=270,
+                colstart=8,  # Comment out for older displays
+            )
+            g = displayio.Group()
+            self._display.root_group = g
+
+        """
         if self._panel.get("panel") == "adafruit-magtag":
             self._display = board.DISPLAY
         else:
             raise NotImplementedError("Hardware other than magtag not configured yet")
+        """
         self._set_display_rotation()
 
     def _set_display_rotation(self):
@@ -171,6 +220,15 @@ class Marquee:
     def connected(self):
         """Whether the MQTT client is connected"""
         return self._client.is_connected()
+
+    @property
+    def busy(self):
+        """Whether the e-paper display is refreshing.
+
+        This reads ``interface.pins.busy`` through the SSD1680 driver when that
+        optional pin is configured.
+        """
+        return self._display.busy
 
     def connect(self):
         """Attempts to connect to Adafruit IO's MQTT Broker."""
@@ -214,16 +272,30 @@ class Marquee:
             msg, self._pending_sleep = self._pending_sleep, None
             self._handle_sleep(msg)
 
+    def get_wake_reason(self):
+        """Sets the reason the board woke from sleep, ``None`` if this is a cold boot."""
+        reason = alarm.wake_alarm
+        if reason is alarm.pin.PinAlarm:
+            self._log("Woke from sleep on a pin alarm")
+            self._wake_reason = "pin"
+        elif reason is alarm.time.TimeAlarm:
+            self._log("Woke from sleep on a time alarm")
+            self._wake_reason = "timer"
+        elif reason is None:
+            self._log("Woke from cold boot or REPL reset")
+            self._wake_reason = None
+        return self._wake_reason
+
     def _on_mqtt_connect(self, client, userdata, flags, rc):
         """Called by MiniMQTT once the broker accepts the connection."""
         self._log("Connected to Adafruit IO!")
 
-        wake_reason = alarm.wake_alarm
-        # Publish status
+        # Determine the wake reason and publish it to the status feed
+        self._wake_reason = self.get_wake_reason()
         try:
             client.publish(
                 self._feed_status,
-                json.dumps({"state": "awake", "wake_reason": wake_reason}),
+                json.dumps({"state": "awake", "wake_reason": self._wake_reason}),
             )
         except (MQTT.MMQTTException, OSError) as err:
             self._log(f"Could not publish awake status ({err}), continuing anyway")
@@ -237,7 +309,7 @@ class Marquee:
         client.publish(f"{self._feed}/get", "get")
         # If we were previously sleeping, we need to fetch the sleep feed to see if we
         # should sleep again
-        if wake_reason is not None:
+        if self._wake_reason is not None:
             self._log("Woke from sleep, fetching sleep feed to see if we should sleep again")
             client.publish(f"{self._feed_sleep}/get", "get")
 
@@ -279,23 +351,21 @@ class Marquee:
                 f"({self._display.width}x{self._display.height})"
             )
 
+        # Draw the image to the display
         tile_grid = displayio.TileGrid(image, pixel_shader=palette)
         group = displayio.Group()
         group.append(tile_grid)
         self._display.root_group = group
 
-        # Wait out the panel refresh (can take up to ~21 seconds)
-        self._wait_for_refresh(self._display.time_to_refresh)
-        # TODO: Maybe stick self._display.time_to_refresh as an optional variable
-        # in the config json?
-        # Wait for the display to draw
-        while self._display.busy:
-            time.sleep(0.1)
+        # Display the image and wait for the panel to refresh
+        self._refresh_display()
+
         # Store the BMP CRC for next wake
         self._store_crc(crc)
+        print("Image displayed!")
 
     def _wait_for_refresh(self, refresh_time):
-        """Prevents from blocking network operations while the display is refreshing."""
+        """Sleep out the panel cooldown without dropping the MQTT connection."""
         ping_interval = _KEEP_ALIVE / 2
         # Computed once -- re-evaluating the deadline each pass would never expire
         deadline = time.monotonic() + refresh_time
@@ -313,7 +383,19 @@ class Marquee:
             # Sleep every pass, not just when a ping was due, or this busy-waits
             time.sleep(0.5)
 
+    def _refresh_display(self):
+        """Refreshes the display and waits for it to finish."""
+        wait_to_refresh = self._display.time_to_refresh
+        if wait_to_refresh > 0:
+            self._log(f"Display cooling down, waiting {wait_to_refresh:.1f}s...")
+            self._wait_for_refresh(wait_to_refresh)
+
+        # NOTE: This call is async
         self._display.refresh()
+
+        self._log("Waiting for display to finish drawing...")
+        while self.busy:
+            time.sleep(0.1)
 
     def _handle_sleep(self, message):
         """Parse a ``{feed}-sleep`` payload, announce the sleep, then sleep.
