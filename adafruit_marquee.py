@@ -96,8 +96,6 @@ class Marquee:
         self._panel = config["display"]
         self._iface = config["interface"]
 
-
-
         # To avoid blocking, MQTT payloads are saved by the callbacks and executed in
         # the main loop
         self._pending_image = None
@@ -151,35 +149,27 @@ class Marquee:
         return config
 
     def _init_display(self):
-      """Attach to the display described by the configuration file."""
-      # TODO: Build the panel from self._iface (spi bus + cs/dc/reset/busy pins) via
-      # adafruit_epd so boards without a built-in display are supported.
-      if self._panel.get("panel") == "adafruit-magtag":
-          self._display = board.DISPLAY
-      else:
-          raise NotImplementedError("Hardware other than magtag not configured yet")
-      self._set_display_rotation()
+        """Attach to the display described by the configuration file."""
+        # TODO: Build the panel from self._iface (spi bus + cs/dc/reset/busy pins) via
+        # adafruit_epd so boards without a built-in display are supported.
+        if self._panel.get("panel") == "adafruit-magtag":
+            self._display = board.DISPLAY
+        else:
+            raise NotImplementedError("Hardware other than magtag not configured yet")
+        self._set_display_rotation()
 
     def _set_display_rotation(self):
-      """Transforms rotation stored in cfg-marquee.json from a quadrant index (0-3) into degrees"""
-      self._panel_rotation = self._panel.get("rotation", 0)
-      if self._panel_rotation in (1, 2, 3):
-          self._panel_rotation *= 90
-      if self._panel_rotation not in (0, 90, 180, 270):
-          raise ValueError(f"Invalid display rotation: {self._panel.get('rotation')}")
-      self._display.rotation = self._panel_rotation
-
-# TODO: Don't see the utility here. Can we remove?
-    """ 
-    @property
-    def display(self):
-        return self._display
-    """
+        """Transforms rotation in cfg-marquee.json from a quadrant index (0-3) to degrees."""
+        self._panel_rotation = self._panel.get("rotation", 0)
+        if self._panel_rotation in (1, 2, 3):
+            self._panel_rotation *= 90
+        if self._panel_rotation not in (0, 90, 180, 270):
+            raise ValueError(f"Invalid display rotation: {self._panel.get('rotation')}")
+        self._display.rotation = self._panel_rotation
 
     @property
     def connected(self):
-        """Whether the MQTT client is connected
-        """
+        """Whether the MQTT client is connected"""
         return self._client.is_connected()
 
     def connect(self):
@@ -198,14 +188,22 @@ class Marquee:
         """
         # Perform a reconnect if the last ping failed during a display refresh
         if self._needs_reconnect:
-            self._needs_reconnect = False
             self._log("Reconnecting to Adafruit IO...")
-            # on_connect resubscribes for us, and resub_topics=True is a no-op anyway
-            # once MiniMQTT has already flipped _is_connected to False.
-            self._client.reconnect(resub_topics=False)
+            try:
+              self._client.reconnect(resub_topics=False)
+              self._needs_reconnect = False
+            except (MQTT.MMQTTException, OSError, AssertionError) as err:
+              # Back off and try again next loop() to avoid dropping into the REPL
+              self._log(f"Reconnect failed, retrying next loop(): {err}")
+              time.sleep(timeout)
+              return
 
         # Poll the message queue
-        self._client.loop(timeout=timeout)
+        try:
+          self._client.loop(timeout=timeout)
+        except (MQTT.MMQTTException, OSError, AssertionError) as err:
+          self._log(f"MQTT loop failed: {err}")
+          self._needs_reconnect = True
 
         # Execute any pending commands from the callbacks
         if self._pending_image is not None:
@@ -284,21 +282,36 @@ class Marquee:
         group.append(tile_grid)
         self._display.root_group = group
 
-        # Wait out the panel's cooldown before refreshing
-        time.sleep(self._display.time_to_refresh)
-        self._display.refresh()
-        # Ping the broker to keep the connection alive while waiting for the display to
-        # finish refreshing
+        # Wait out the panel refresh (can take up to ~21 seconds)
+        self._wait_for_refresh(self._display.time_to_refresh)
+        # TODO: Maybe stick self._display.time_to_refresh as an optional variable
+        # in the config json?
+        # Wait for the display to draw
         while self._display.busy:
-            if not self._needs_reconnect:
-                try:
-                    self._client.ping()
-                except (MQTT.MMQTTException, OSError) as err:
-                    self._log(f"Ping failed ({err}), will reconnect after the refresh")
-                    self._needs_reconnect = True
-            time.sleep(0.5)
+            time.sleep(0.1)
         # Store the BMP CRC for next wake
         self._store_crc(crc)
+
+    def _wait_for_refresh(self, refresh_time):
+        """Prevents from blocking network operations while the display is refreshing."""
+        ping_interval = _KEEP_ALIVE / 2
+        # Computed once -- re-evaluating the deadline each pass would never expire
+        deadline = time.monotonic() + refresh_time
+        prv_ping = time.monotonic()
+
+        while time.monotonic() < deadline:
+            if time.monotonic() - prv_ping >= ping_interval:
+                prv_ping = time.monotonic()
+                if not self._needs_reconnect:
+                    try:
+                        self._client.ping()
+                    except (MQTT.MMQTTException, OSError) as err:
+                        self._log(f"Ping failed ({err}), will reconnect after the refresh")
+                        self._needs_reconnect = True
+            # Sleep every pass, not just when a ping was due, or this busy-waits
+            time.sleep(0.5)
+
+        self._display.refresh()
 
     def _handle_sleep(self, message):
         """Parse a ``{feed}-sleep`` payload, announce the sleep, then sleep.
