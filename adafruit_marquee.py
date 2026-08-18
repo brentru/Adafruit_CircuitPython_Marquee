@@ -34,8 +34,11 @@ import adafruit_minimqtt.adafruit_minimqtt as MQTT
 import alarm
 import board
 import busio
-import displayio
 from fourwire import FourWire
+import displayio
+
+# Display drivers
+import adafruit_ssd1680
 
 __version__ = "0.0.0+auto.0"
 __repo__ = "https://github.com/adafruit/Adafruit_CircuitPython_Marquee.git"
@@ -52,11 +55,33 @@ _DEFAULT_CONFIG_FILE = "cfg-marquee.json"
 _ALARM_TYPES = ("timer", "pin", "timer+pin")
 _SLEEP_MODES = ("light", "deep")
 
+# Interface kinds understood by Marquee._init_display()
+_IFACE_BUILTIN = "builtin"
+_IFACE_SPI_EPD = "spi_epd"
+
 
 def get_pin_from_cfg(pin_cfg, name):
     """Resolve a board.* pin name from a config section."""
     pin_name = pin_cfg.get(name)
     return getattr(board, pin_name.replace("board.", "")) if pin_name else None
+
+
+def _build_ssd1680(display_bus, panel, busy_pin):
+    """Constructs an SSD1680 e-paper display driver."""
+    return adafruit_ssd1680.SSD1680(
+        display_bus,
+        width=panel["width"],
+        height=panel["height"],
+        busy_pin=busy_pin,
+        highlight_color=0xFF0000,
+        colstart=8,  # Comment out for older displays
+    )
+
+
+# Maps the driver to the function that builds it
+_EPD_DRIVERS = {
+    "SSD1680": _build_ssd1680,
+}
 
 
 class Marquee:
@@ -86,6 +111,7 @@ class Marquee:
         debug=False,
     ):
         self._debug = debug
+        self._wake_reason = None
         self._wake_reason = self.get_wake_reason()
 
         for name, value in (
@@ -159,53 +185,72 @@ class Marquee:
 
     def _init_display(self):
         """Attach to the display described by the configuration file."""
-        if self._panel.get("driver") == "SSD1680":
-            # Initialize SSD1680 display driver
-            import adafruit_ssd1680
-
-            displayio.release_displays()
-            # Create the display bus
-            spi_config = self._iface.get("spi", {})
-            if "sck" in spi_config or "mosi" in spi_config:
-                spi = busio.SPI(
-                    clock=get_pin_from_cfg(spi_config, "sck"),
-                    MOSI=get_pin_from_cfg(spi_config, "mosi"),
-                )
-            else:
-                spi = board.SPI()
-            pin_config = self._iface.get("pins", {})
-            epd_cs = get_pin_from_cfg(pin_config, "cs")
-            epd_dc = get_pin_from_cfg(pin_config, "dc")
-            epd_reset = get_pin_from_cfg(pin_config, "reset")
-            self._epd_busy_pin = get_pin_from_cfg(pin_config, "busy")
-            display_bus = FourWire(
-                spi,
-                command=epd_dc,
-                chip_select=epd_cs,
-                reset=epd_reset,
-                baudrate=spi_config.get("baudrate", 1_000_000),
-            )
-            time.sleep(1)
-            # Create the SSD1680 display driver
-            self._display = adafruit_ssd1680.SSD1680(
-                display_bus,
-                width=250,
-                height=122,
-                busy_pin=self._epd_busy_pin,
-                highlight_color=0xFF0000,
-                rotation=270,
-                colstart=8,  # Comment out for older displays
-            )
-            g = displayio.Group()
-            self._display.root_group = g
-
-        """
-        if self._panel.get("panel") == "adafruit-magtag":
-            self._display = board.DISPLAY
+        kind = self._iface.get("kind", _IFACE_BUILTIN)
+        if kind == _IFACE_BUILTIN:
+            self._display = self._init_builtin_display()
+        elif kind == _IFACE_SPI_EPD:
+            self._display = self._init_spi_epd_display()
         else:
-            raise NotImplementedError("Hardware other than magtag not configured yet")
-        """
+            raise ValueError(f"Unsupported interface kind: {kind}")
         self._set_display_rotation()
+
+    def _init_builtin_display(self):
+        """Return the display the board already provides, such as on the MagTag.
+
+        Deliberately does not release displays -- the built-in display is the one being
+        adopted here, releasing it would tear it down.
+        """
+        if not hasattr(board, "DISPLAY"):
+            raise RuntimeError(
+                f"interface.kind is '{_IFACE_BUILTIN}' but this board has no board.DISPLAY"
+            )
+        self._log("Using the board's built-in display")
+        self._epd_busy_pin = None
+        return board.DISPLAY
+
+    def _init_spi_epd_display(self):
+        """Build the SPI e-paper display named by ``display.driver``."""
+        driver = self._panel.get("driver")
+        builder = _EPD_DRIVERS.get(driver)
+        if builder is None:
+            raise ValueError(
+                f"Unsupported display driver: {driver}. "
+                f"Supported drivers: {', '.join(_EPD_DRIVERS)}"
+            )
+        for key in ("width", "height"):
+            if key not in self._panel:
+                raise ValueError(f"Interface kind '{_IFACE_SPI_EPD}' requires display.{key}")
+
+        self._log(f"Initializing {driver} display")
+        displayio.release_displays()
+        display_bus = self._init_spi_bus()
+        self._epd_busy_pin = get_pin_from_cfg(self._iface.get("pins", {}), "busy")
+        display = builder(display_bus, self._panel, self._epd_busy_pin)
+        display.root_group = displayio.Group()
+        return display
+
+    def _init_spi_bus(self):
+        """Build the FourWire bus described by ``interface.spi`` and ``interface.pins``."""
+        spi_config = self._iface.get("spi", {})
+        if "sck" in spi_config or "mosi" in spi_config:
+            spi = busio.SPI(
+                clock=get_pin_from_cfg(spi_config, "sck"),
+                MOSI=get_pin_from_cfg(spi_config, "mosi"),
+            )
+        else:
+            spi = board.SPI()
+
+        pin_config = self._iface.get("pins", {})
+        display_bus = FourWire(
+            spi,
+            command=get_pin_from_cfg(pin_config, "dc"),
+            chip_select=get_pin_from_cfg(pin_config, "cs"),
+            reset=get_pin_from_cfg(pin_config, "reset"),
+            baudrate=spi_config.get("baudrate", 1_000_000),
+        )
+        # Give the panel time to come out of reset before the driver talks to it
+        time.sleep(1)
+        return display_bus
 
     def _set_display_rotation(self):
         """Transforms rotation in cfg-marquee.json from a quadrant index (0-3) to degrees."""
@@ -225,8 +270,8 @@ class Marquee:
     def busy(self):
         """Whether the e-paper display is refreshing.
 
-        This reads ``interface.pins.busy`` through the SSD1680 driver when that
-        optional pin is configured.
+        This reads ``interface.pins.busy`` through the panel driver when that optional
+        pin is configured.
         """
         return self._display.busy
 
@@ -273,15 +318,15 @@ class Marquee:
             self._handle_sleep(msg)
 
     def get_wake_reason(self):
-        """Sets the reason the board woke from sleep, ``None`` if this is a cold boot."""
+        """Return the reason the board woke from sleep, ``None`` on cold boot."""
         reason = alarm.wake_alarm
-        if reason is alarm.pin.PinAlarm:
+        if isinstance(reason, alarm.pin.PinAlarm):
             self._log("Woke from sleep on a pin alarm")
             self._wake_reason = "pin"
-        elif reason is alarm.time.TimeAlarm:
+        elif isinstance(reason, alarm.time.TimeAlarm):
             self._log("Woke from sleep on a time alarm")
             self._wake_reason = "timer"
-        elif reason is None:
+        else:
             self._log("Woke from cold boot or REPL reset")
             self._wake_reason = None
         return self._wake_reason
