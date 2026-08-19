@@ -55,7 +55,7 @@ _DEFAULT_CONFIG_FILE = "cfg-marquee.json"
 _ALARM_TYPES = ("timer", "pin", "timer+pin")
 _SLEEP_MODES = ("light", "deep")
 
-# Interface kinds understood by Marquee._init_display()
+# Interface types understood by Marquee._init_display()
 _IFACE_BUILTIN = "builtin"
 _IFACE_SPI_EPD = "spi_epd"
 
@@ -66,15 +66,17 @@ def get_pin_from_cfg(pin_cfg, name):
     return getattr(board, pin_name.replace("board.", "")) if pin_name else None
 
 
-def _build_ssd1680(display_bus, panel, busy_pin):
-    """Constructs an SSD1680 e-paper display driver."""
+def _build_ssd1680(display_bus, panel, busy_pin, rotation):
+    """Constructs an SSD1680 e-paper display driver.
+    """
     return adafruit_ssd1680.SSD1680(
         display_bus,
         width=panel["width"],
         height=panel["height"],
+        rotation=rotation,
         busy_pin=busy_pin,
         highlight_color=0xFF0000,
-        colstart=8,  # Comment out for older displays
+        colstart=panel.get("colstart", 8),
     )
 
 
@@ -185,24 +187,24 @@ class Marquee:
 
     def _init_display(self):
         """Attach to the display described by the configuration file."""
-        kind = self._iface.get("kind", _IFACE_BUILTIN)
-        if kind == _IFACE_BUILTIN:
+        # NOTE: Rotation needs to be passed into the display driver's constructor, so parse it here
+        self._panel_rotation = self._parse_rotation()
+
+        # Attempt to initialize the display based on the interface type
+        iface_type = self._iface.get("type", _IFACE_BUILTIN)
+        if iface_type == _IFACE_BUILTIN:
             self._display = self._init_builtin_display()
-        elif kind == _IFACE_SPI_EPD:
+        elif iface_type == _IFACE_SPI_EPD:
             self._display = self._init_spi_epd_display()
         else:
-            raise ValueError(f"Unsupported interface kind: {kind}")
-        self._set_display_rotation()
+            raise ValueError(f"Unsupported interface type: {iface_type}")
+        self._display.rotation = self._panel_rotation
 
     def _init_builtin_display(self):
-        """Return the display the board already provides, such as on the MagTag.
-
-        Deliberately does not release displays -- the built-in display is the one being
-        adopted here, releasing it would tear it down.
-        """
+        """Returns the display the board already provides, such as the MagTag's built-in display."""
         if not hasattr(board, "DISPLAY"):
             raise RuntimeError(
-                f"interface.kind is '{_IFACE_BUILTIN}' but this board has no board.DISPLAY"
+                f"interface.type is '{_IFACE_BUILTIN}' but this board has no board.DISPLAY"
             )
         self._log("Using the board's built-in display")
         self._epd_busy_pin = None
@@ -219,15 +221,19 @@ class Marquee:
             )
         for key in ("width", "height"):
             if key not in self._panel:
-                raise ValueError(f"Interface kind '{_IFACE_SPI_EPD}' requires display.{key}")
+                raise ValueError(f"Interface type '{_IFACE_SPI_EPD}' requires display.{key}")
 
         self._log(f"Initializing {driver} display")
         displayio.release_displays()
         display_bus = self._init_spi_bus()
         self._epd_busy_pin = get_pin_from_cfg(self._iface.get("pins", {}), "busy")
-        display = builder(display_bus, self._panel, self._epd_busy_pin)
+        if self._epd_busy_pin is None:
+            # Without a busy pin, display.busy is epaperdisplay's `refresh_time`
+            self._log("No busy pin configured, refresh time is estimated")
+        display = builder(display_bus, self._panel, self._epd_busy_pin, self._panel_rotation)
         display.root_group = displayio.Group()
         return display
+
 
     def _init_spi_bus(self):
         """Build the FourWire bus described by ``interface.spi`` and ``interface.pins``."""
@@ -252,14 +258,14 @@ class Marquee:
         time.sleep(1)
         return display_bus
 
-    def _set_display_rotation(self):
+    def _parse_rotation(self):
         """Transforms rotation in cfg-marquee.json from a quadrant index (0-3) to degrees."""
-        self._panel_rotation = self._panel.get("rotation", 0)
-        if self._panel_rotation in (1, 2, 3):
-            self._panel_rotation *= 90
-        if self._panel_rotation not in (0, 90, 180, 270):
+        rotation = self._panel.get("rotation", 0)
+        if rotation in (1, 2, 3):
+            rotation *= 90
+        if rotation not in (0, 90, 180, 270):
             raise ValueError(f"Invalid display rotation: {self._panel.get('rotation')}")
-        self._display.rotation = self._panel_rotation
+        return rotation
 
     @property
     def connected(self):
@@ -439,16 +445,16 @@ class Marquee:
         self._display.refresh()
 
         self._log("Waiting for display to finish drawing...")
+        busy_start = time.monotonic()
         while self.busy:
             time.sleep(0.1)
+        self._log(
+            f"Drew in {time.monotonic() - busy_start:.1f}s "
+            f"after a {wait_to_refresh:.1f}s cooldown"
+        )
 
     def _handle_sleep(self, message):
-        """Parse a ``{feed}-sleep`` payload, announce the sleep, then sleep.
-
-        For a ``"deep"`` request this does not return -- the board resets and re-runs
-        ``code.py`` on wake. Returns immediately when the payload is unusable or
-        describes no armable alarm.
-        """
+        """Parse a the ``{feed}-sleep`` payload, publish the sleep to the broker, then sleep."""
         parsed = self._parse_sleep(message)
         if parsed is None:
             return
@@ -553,7 +559,7 @@ class Marquee:
 
         try:
             bytes_img = BytesIO(msg_decoded)
-        except Exception:  # noqa: BLE001 - matches the proof-of-concept's bare except
+        except Exception:
             self._log("Error converting message to BytesIO")
             return None
         return bytes_img
